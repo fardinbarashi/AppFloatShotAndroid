@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bubble">#E6202124</color>
+    <color name="bubble_ring">#66FFFFFF</color>
+    <color name="accent">#FF3D7BF7</color>
+    <color name="icon_bg">#FF1E2A44</color>
+    <color name="screen_bg">#FFF7F8FA</color>
+    <color name="text_main">#FF1B1C1F</color>
+    <color name="text_muted">#FF5F6368</color>
+</resources>

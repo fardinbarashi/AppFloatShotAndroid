@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FloatShot</string>
+    <string name="intro">A small button floats on top of every app. Tap it to take a screenshot – the button itself is hidden from the picture. Drag it anywhere. Long-press it to close.</string>
+    <string name="step_overlay">1. Allow display over other apps</string>
+    <string name="step_start">2. Show the button</string>
+    <string name="stop">Hide the button</string>
+    <string name="overlay_ok">Display over other apps: allowed</string>
+    <string name="overlay_missing">Display over other apps: not allowed yet</string>
+    <string name="saved_to">Screenshots are saved to Pictures/FloatShot.</string>
+    <string name="notif_channel">Floating button</string>
+    <string name="notif_title">FloatShot is running</string>
+    <string name="notif_text">Tap the floating button to take a screenshot.</string>
+    <string name="notif_stop">Stop</string>
+    <string name="toast_saved">Screenshot saved</string>
+    <string name="toast_failed">Could not take the screenshot</string>
+    <string name="toast_closed">FloatShot closed</string>
+    <string name="toast_need_overlay">Allow display over other apps first</string>
+    <string name="toast_denied">Screen capture was not allowed</string>
+    <string name="bubble_desc">Take screenshot</string>
+</resources>
