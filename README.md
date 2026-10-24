@@ -1,5 +1,5 @@
 # FloatShot
-
+![](githubRepoContentDeleteIfYouWant/logo.jpg)
 A small Android app that puts a floating camera button on top of every app.
 
 - **Tap** the button: a screenshot is taken. The button hides itself first, so it is never in the picture.
