@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -17,6 +18,8 @@ class MainActivity : Activity() {
 
     private lateinit var overlayStatus: TextView
     private lateinit var btnOverlay: Button
+    private lateinit var btnStart: Button
+    private lateinit var btnStop: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,10 +37,15 @@ class MainActivity : Activity() {
             )
         }
 
-        findViewById<Button>(R.id.btnStart).setOnClickListener { askForCapture() }
+        btnStart = findViewById(R.id.btnStart)
+        btnStart.setOnClickListener { askForCapture() }
 
-        findViewById<Button>(R.id.btnStop).setOnClickListener {
+        btnStop = findViewById(R.id.btnStop)
+        btnStop.setOnClickListener {
             stopService(Intent(this, BubbleService::class.java))
+            // The service stops on the next main-loop pass; show the new state right away.
+            btnStop.isEnabled = false
+            btnStart.isEnabled = Settings.canDrawOverlays(this)
         }
 
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -52,6 +60,8 @@ class MainActivity : Activity() {
         val allowed = Settings.canDrawOverlays(this)
         overlayStatus.setText(if (allowed) R.string.overlay_ok else R.string.overlay_missing)
         btnOverlay.isEnabled = !allowed
+        btnStart.isEnabled = allowed && !BubbleService.running
+        btnStop.isEnabled = BubbleService.running
     }
 
     private fun askForCapture() {
@@ -60,8 +70,15 @@ class MainActivity : Activity() {
             return
         }
         val pm = getSystemService(MediaProjectionManager::class.java)
+        // Android 14+ can offer "a single app". Ask for the whole screen, because the
+        // button floats over every app and a single-app capture turns black elsewhere.
+        val consent = if (Build.VERSION.SDK_INT >= 34) {
+            pm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+        } else {
+            pm.createScreenCaptureIntent()
+        }
         @Suppress("DEPRECATION")
-        startActivityForResult(pm.createScreenCaptureIntent(), REQ_CAPTURE)
+        startActivityForResult(consent, REQ_CAPTURE)
     }
 
     @Deprecated("Deprecated in Java")

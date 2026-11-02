@@ -1,7 +1,6 @@
 package com.fardin.floatshot
 
 import android.animation.ValueAnimator
-import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -28,12 +27,13 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.DisplayMetrics
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
-import android.widget.ImageView
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -50,26 +50,33 @@ class BubbleService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var wm: WindowManager
 
-    private var bubble: ImageView? = null
+    private var bubble: BubbleView? = null
     private lateinit var params: WindowManager.LayoutParams
 
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
-    private var screenW = 0
-    private var screenH = 0
 
+    // Grabs frames. Never blocked by slow work, so frame times stay accurate.
     private lateinit var captureThread: HandlerThread
     private lateinit var capture: Handler
 
+    // Writes PNG files, one after another.
+    private lateinit var saveThread: HandlerThread
+    private lateinit var save: Handler
+
     // Fields below are touched only on the capture thread.
+    private var mirrorW = 0
+    private var mirrorH = 0
     private var latest: Image? = null
     private var latestAt = 0L
-    private var hiddenAt = 0L
+    private var hideRequestedAt = 0L
+    private var hideSettledAt = 0L
     private var waiting = false
 
     // Main thread only.
-    private var busy = false
+    private var shooting = false   // button hidden, waiting for a clean frame
+    private var pendingSaves = 0   // PNGs queued or being written
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -84,6 +91,8 @@ class BubbleService : Service() {
         wm = getSystemService(WindowManager::class.java)
         captureThread = HandlerThread("shot").apply { start() }
         capture = Handler(captureThread.looper)
+        saveThread = HandlerThread("save").apply { start() }
+        save = Handler(saveThread.looper)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -125,6 +134,7 @@ class BubbleService : Service() {
 
         startMirror()
         showBubble()
+        running = true
         return START_NOT_STICKY
     }
 
@@ -149,8 +159,8 @@ class BubbleService : Service() {
 
     private fun startMirror() {
         val (w, h) = screenSize()
-        screenW = w
-        screenH = h
+        mirrorW = w
+        mirrorH = h
         val r = newReader(w, h)
         reader = r
         virtualDisplay = projection?.createVirtualDisplay(
@@ -171,29 +181,37 @@ class BubbleService : Service() {
         latest?.close()
         latest = img
         latestAt = SystemClock.uptimeMillis()
-        if (waiting && latestAt >= hiddenAt + SAFE_GAP_MS) deliver()
+        if (waiting && latestAt >= hideSettledAt + SAFE_GAP_MS) deliver()
     }
 
-    /** Called on the capture thread right after the button was hidden. */
-    private fun startWaiting(hideTime: Long) {
-        hiddenAt = hideTime
+    /**
+     * Capture thread. [requestedAt] is when the button was set to invisible,
+     * [settledAt] is two screen refreshes later, when the hidden button has been drawn.
+     */
+    private fun startWaiting(requestedAt: Long, settledAt: Long) {
+        hideRequestedAt = requestedAt
+        hideSettledAt = settledAt
         waiting = true
-        if (latest != null && latestAt >= hiddenAt + SAFE_GAP_MS) {
+        if (latest != null && latestAt >= hideSettledAt + SAFE_GAP_MS) {
             deliver()
             return
         }
-        // A still screen may only produce one new frame (the one where the button
-        // disappeared). If nothing newer shows up, use the newest frame after hiding.
-        capture.postDelayed(giveUp, TIMEOUT_MS)
+        // A still screen only produces the frame where the button disappeared, and
+        // that one can arrive before settledAt. If nothing newer shows up, use the
+        // newest frame that came after the button was hidden.
+        capture.postDelayed(giveUp, STILL_SCREEN_MS)
     }
 
     private val giveUp = Runnable {
         if (!waiting) return@Runnable
-        if (latest != null && latestAt > hiddenAt) {
+        if (latest != null && latestAt > hideRequestedAt) {
             deliver()
         } else {
             waiting = false
-            main.post { finishShot(false) }
+            main.post {
+                showBubbleAgain()
+                showResult(false)
+            }
         }
     }
 
@@ -203,17 +221,34 @@ class BubbleService : Service() {
         val img = latest ?: return
         latest = null
 
-        val ok = try {
-            val bmp = img.toBitmap()
-            img.close()
-            val saved = savePng(bmp)
-            bmp.recycle()
-            saved
+        val bmp = try {
+            img.toBitmap()
         } catch (e: Exception) {
+            null
+        } finally {
             img.close()
-            false
         }
-        main.post { finishShot(ok) }
+        if (bmp == null) {
+            main.post {
+                showBubbleAgain()
+                showResult(false)
+            }
+            return
+        }
+        // The frame is in memory, so the button can come back (and take the next
+        // screenshot) while the PNG is written on the save thread.
+        main.post {
+            pendingSaves++
+            showBubbleAgain()
+        }
+        save.post {
+            val ok = savePng(bmp)
+            bmp.recycle()
+            main.post {
+                pendingSaves--
+                showResult(ok)
+            }
+        }
     }
 
     private fun Image.toBitmap(): Bitmap {
@@ -238,39 +273,59 @@ class BubbleService : Service() {
             put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/FloatShot")
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
-        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            ?: return false
-        val written = contentResolver.openOutputStream(uri)?.use {
-            bmp.compress(Bitmap.CompressFormat.PNG, 100, it)
-        } ?: false
-        if (!written) {
-            contentResolver.delete(uri, null, null)
-            return false
+        val uri = try {
+            contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        } catch (e: Exception) {
+            null
+        } ?: return false
+        val written = try {
+            contentResolver.openOutputStream(uri)?.use {
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, it)
+            } ?: false
+        } catch (e: Exception) {
+            false
         }
-        values.clear()
-        values.put(MediaStore.Images.Media.IS_PENDING, 0)
-        contentResolver.update(uri, values, null, null)
-        return true
+        return try {
+            if (!written) {
+                contentResolver.delete(uri, null, null)
+                false
+            } else {
+                values.clear()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+                true
+            }
+        } catch (e: Exception) {
+            false
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        capture.post { resizeMirror() }
-        main.post { keepBubbleOnScreen() }
+        // The new size can lag slightly behind the rotation, so check again shortly after.
+        main.post { followScreenSize() }
+        main.postDelayed({ followScreenSize() }, 400)
+    }
+
+    /** Main thread: read the current screen size and pass it to the mirror and the button. */
+    private fun followScreenSize() {
+        val (w, h) = screenSize()
+        val dpi = resources.displayMetrics.densityDpi
+        capture.post { resizeMirror(w, h, dpi) }
+        keepBubbleOnScreen()
     }
 
     /** Capture thread: follow rotation so screenshots keep the right shape. */
-    private fun resizeMirror() {
+    private fun resizeMirror(w: Int, h: Int, dpi: Int) {
         val vd = virtualDisplay ?: return
-        val (w, h) = screenSize()
-        if (w == screenW && h == screenH) return
-        screenW = w
-        screenH = h
+        if (w == mirrorW && h == mirrorH) return
+        mirrorW = w
+        mirrorH = h
         val old = reader
         val r = newReader(w, h)
         reader = r
-        vd.resize(w, h, resources.displayMetrics.densityDpi)
         vd.surface = r.surface
+        vd.resize(w, h, dpi)
         latest?.close()
         latest = null
         old?.close()
@@ -280,11 +335,11 @@ class BubbleService : Service() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    @SuppressLint("ClickableViewAccessibility")
     private fun showBubble() {
         if (bubble != null) return
         val size = dp(52)
         val prefs = getSharedPreferences("bubble", MODE_PRIVATE)
+        val (screenW, screenH) = screenSize()
 
         params = WindowManager.LayoutParams(
             size, size,
@@ -297,13 +352,27 @@ class BubbleService : Service() {
             y = prefs.getInt("y", screenH / 3)
         }
 
-        val view = ImageView(this).apply {
+        val view = BubbleView(this).apply {
             setImageResource(R.drawable.ic_camera)
             setBackgroundResource(R.drawable.bubble_bg)
             val pad = dp(13)
             setPadding(pad, pad, pad, pad)
             contentDescription = getString(R.string.bubble_desc)
             elevation = dp(6).toFloat()
+            // Lets TalkBack read out "Screenshot saved" when the description changes.
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            // TalkBack and Switch Access close the button through "long press".
+            accessibilityDelegate = object : View.AccessibilityDelegate() {
+                override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
+                    super.onInitializeAccessibilityNodeInfo(host, info)
+                    info.addAction(
+                        AccessibilityNodeInfo.AccessibilityAction(
+                            AccessibilityNodeInfo.ACTION_LONG_CLICK,
+                            getString(R.string.close_button)
+                        )
+                    )
+                }
+            }
         }
 
         val slop = ViewConfiguration.get(this).scaledTouchSlop
@@ -315,11 +384,12 @@ class BubbleService : Service() {
         var longFired = false
         val longPress = Runnable {
             longFired = true
-            Toast.makeText(this, R.string.toast_closed, Toast.LENGTH_SHORT).show()
-            stopSelf()
+            closeBubble()
         }
 
         view.setOnTouchListener { v, e ->
+            // While a screenshot is being taken the button is hidden; ignore touches.
+            if (shooting) return@setOnTouchListener true
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX
@@ -351,10 +421,17 @@ class BubbleService : Service() {
                     if (moved) {
                         snapToEdge()
                     } else if (e.actionMasked == MotionEvent.ACTION_UP) {
-                        takeShot()
+                        v.performClick()
                     }
                 }
             }
+            true
+        }
+        // Taps (and TalkBack's double-tap) arrive here through performClick().
+        view.setOnClickListener { takeShot() }
+        // Only reached from accessibility services; finger long-presses are timed above.
+        view.setOnLongClickListener {
+            closeBubble()
             true
         }
 
@@ -393,27 +470,63 @@ class BubbleService : Service() {
             .putInt("x", params.x).putInt("y", params.y).apply()
     }
 
-    private fun takeShot() {
-        val v = bubble ?: return
-        if (busy || virtualDisplay == null) return
-        busy = true
-        v.visibility = View.INVISIBLE
-        val hideTime = SystemClock.uptimeMillis()
-        capture.post { startWaiting(hideTime) }
+    private fun closeBubble() {
+        Toast.makeText(this, R.string.toast_closed, Toast.LENGTH_SHORT).show()
+        stopSelf()
     }
 
-    private fun finishShot(ok: Boolean) {
-        busy = false
+    private fun takeShot() {
+        val v = bubble ?: return
+        if (shooting || virtualDisplay == null) return
+        if (pendingSaves >= MAX_PENDING_SAVES) {
+            // Still writing earlier screenshots; a short pulse shows the tap was seen.
+            v.animate().scaleX(0.8f).scaleY(0.8f).setDuration(90)
+                .withEndAction { v.animate().scaleX(1f).scaleY(1f).setDuration(90).start() }
+                .start()
+            return
+        }
+        shooting = true
+        v.animate().cancel()
+        v.visibility = View.INVISIBLE
+        val requestedAt = SystemClock.uptimeMillis()
+        // Wait two screen refreshes so the hidden button has really been drawn.
+        val choreographer = Choreographer.getInstance()
+        choreographer.postFrameCallback {
+            choreographer.postFrameCallback {
+                val settledAt = SystemClock.uptimeMillis()
+                capture.post { startWaiting(requestedAt, settledAt) }
+            }
+        }
+    }
+
+    private fun showBubbleAgain() {
+        shooting = false
         val v = bubble ?: return
         v.visibility = View.VISIBLE
         v.scaleX = 0.6f
         v.scaleY = 0.6f
         v.animate().scaleX(1f).scaleY(1f).setDuration(160).start()
-        Toast.makeText(
-            this,
-            if (ok) R.string.toast_saved else R.string.toast_failed,
-            Toast.LENGTH_SHORT
-        ).show()
+    }
+
+    /**
+     * Feedback is shown on the button itself (green tick or red mark) instead of a
+     * toast, so it can never end up in the next screenshot.
+     */
+    private fun showResult(ok: Boolean) {
+        val v = bubble ?: return
+        main.removeCallbacks(resetLook)
+        v.setImageResource(if (ok) R.drawable.ic_check else R.drawable.ic_error)
+        v.setBackgroundResource(if (ok) R.drawable.bubble_bg_ok else R.drawable.bubble_bg_fail)
+        v.contentDescription = getString(if (ok) R.string.toast_saved else R.string.toast_failed)
+        main.postDelayed(resetLook, RESULT_MS)
+    }
+
+    private val resetLook = Runnable {
+        bubble?.apply {
+            setImageResource(R.drawable.ic_camera)
+            setBackgroundResource(R.drawable.bubble_bg)
+            contentDescription = getString(R.string.bubble_desc)
+        }
     }
 
     // ----------------------------------------------------------- notification
@@ -444,6 +557,7 @@ class BubbleService : Service() {
     // ----------------------------------------------------------------- cleanup
 
     override fun onDestroy() {
+        running = false
         main.removeCallbacksAndMessages(null)
         bubble?.let {
             savePosition()
@@ -462,6 +576,8 @@ class BubbleService : Service() {
             reader = null
             proj?.unregisterCallback(projectionCallback)
             proj?.stop()
+            // After any running deliver() has queued its PNG, let queued PNGs finish.
+            saveThread.quitSafely()
             captureThread.quitSafely()
         }
         super.onDestroy()
@@ -474,8 +590,17 @@ class BubbleService : Service() {
         private const val CHANNEL = "bubble"
         private const val NOTIF_ID = 1
 
-        /** Frames that arrive this long after hiding are sure to be without the button. */
-        private const val SAFE_GAP_MS = 60L
-        private const val TIMEOUT_MS = 700L
+        /** Frames that arrive this long after the hide has settled are without the button. */
+        private const val SAFE_GAP_MS = 50L
+        /** On a still screen no newer frame comes; use the last one after this wait. */
+        private const val STILL_SCREEN_MS = 200L
+        private const val RESULT_MS = 900L
+        /** Each queued screenshot holds a full-size bitmap in memory. */
+        private const val MAX_PENDING_SAVES = 2
+
+        /** True while the floating button is on screen. Read by MainActivity. */
+        @Volatile
+        var running = false
+            private set
     }
 }

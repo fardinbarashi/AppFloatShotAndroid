@@ -18,4 +18,5 @@
     <string name="toast_need_overlay">Allow display over other apps first</string>
     <string name="toast_denied">Screen capture was not allowed</string>
     <string name="bubble_desc">Take screenshot</string>
+    <string name="close_button">Close FloatShot</string>
 </resources>

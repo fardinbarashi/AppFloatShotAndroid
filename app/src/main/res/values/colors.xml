@@ -2,6 +2,8 @@
 <resources>
     <color name="bubble">#E6202124</color>
     <color name="bubble_ring">#66FFFFFF</color>
+    <color name="bubble_ok">#E61E8E3E</color>
+    <color name="bubble_fail">#E6C5221F</color>
     <color name="accent">#FF3D7BF7</color>
     <color name="icon_bg">#FF1E2A44</color>
     <color name="screen_bg">#FFF7F8FA</color>
